@@ -2,15 +2,6 @@
 
 Starter Next.js project for the 2GoDeals AI landing page.
 
-## Environment variables
-
-Create `.env.local` with:
-
-```bash
-NEXT_PUBLIC_SUPABASE_URL=https://your-project-ref.supabase.co
-NEXT_PUBLIC_SUPABASE_ANON_KEY=your-supabase-anon-key
-```
-
 ## Run locally
 
 ```bash

@@ -1,13 +1,525 @@
+FILE: package.json
+{
+  "name": "2godeals-ai",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "@supabase/ssr": "^0.10.2",
+    "@supabase/supabase-js": "^2.104.0",
+    "lucide-react": "^0.511.0",
+    "next": "14.2.30",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.57",
+    "@types/react": "^18.3.23",
+    "@types/react-dom": "^18.3.7",
+    "autoprefixer": "^10.4.20",
+    "eslint": "^8.57.1",
+    "eslint-config-next": "14.2.30",
+    "postcss": "^8.5.3",
+    "tailwindcss": "^3.4.17",
+    "typescript": "^5.8.3"
+  }
+}
+
+FILE: .env.example
+NEXT_PUBLIC_SUPABASE_URL=https://your-project-ref.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=your-supabase-anon-key
+
+FILE: lib/market.ts
+export type Merchant = {
+  id: string;
+  name: string;
+  countryCode: string;
+  sellerType: string;
+  trustScore: number;
+  returnPolicy: string;
+  websiteUrl: string;
+};
+
+export type Offer = {
+  id: string;
+  productId: string;
+  merchantId: string;
+  seller: string;
+  sellerType: string;
+  country: string;
+  countryCode: string;
+  price: number;
+  shipping: number;
+  currency: string;
+  taxes: string;
+  eta: string;
+  trust: number;
+  returns: string;
+  badge: string;
+  urlLabel: string;
+  merchantUrl: string;
+  rank: number;
+  merchant: Merchant | null;
+};
+
+export type Product = {
+  id: string;
+  name: string;
+  brand: string;
+  model: string;
+  category: string;
+  description: string;
+  confidence: number;
+  highlights: string[];
+  imageUrl: string;
+};
+
+export type SearchResult = Product & {
+  bestOffer: Offer | null;
+};
+
+type RawRecord = Record<string, any>;
+
+const DEFAULT_HIGHLIGHTS = [
+  "AI exact-match detection",
+  "Cross-country offer ranking",
+  "Official vs independent store labels",
+];
+
+export function money(value: number, currency = "USD") {
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: currency || "USD",
+    maximumFractionDigits: 2,
+  }).format(Number.isFinite(value) ? value : 0);
+}
+
+export function totalCost(offer: Pick<Offer, "price" | "shipping">) {
+  return (offer.price || 0) + (offer.shipping || 0);
+}
+
+function pickFirst(raw: RawRecord | null | undefined, keys: string[], fallback: any = undefined) {
+  if (!raw) return fallback;
+  for (const key of keys) {
+    const value = raw[key];
+    if (value !== null && value !== undefined && value !== "") return value;
+  }
+  return fallback;
+}
+
+function toNumber(value: any, fallback = 0) {
+  if (typeof value === "number") return Number.isFinite(value) ? value : fallback;
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  }
+  return fallback;
+}
+
+function toStringArray(value: any, fallback: string[] = []) {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item)).filter(Boolean);
+  }
+  if (typeof value === "string") {
+    return value
+      .split(/[|\n,]/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+  return fallback;
+}
+
+function titleCase(value: string) {
+  return value
+    .toLowerCase()
+    .split(/[_\s-]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function normalizeSellerType(value: any) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw) return "Independent seller";
+  if (raw.includes("official")) return "Official store";
+  if (raw.includes("brand")) return "Official store";
+  return "Independent seller";
+}
+
+function normalizeCountryCode(value: any) {
+  const code = String(value || "").trim().toUpperCase();
+  if (!code) return "US";
+  return code;
+}
+
+function buildBadge(sellerType: string, countryCode: string, referenceCountryCode?: string) {
+  if (sellerType === "Official store") return "Official";
+  if (referenceCountryCode && countryCode && countryCode !== referenceCountryCode) return "Cross-border";
+  return "Best visible price";
+}
+
+function etaToScore(eta: string) {
+  const match = eta.match(/(\d+)/);
+  return match ? Number(match[1]) : Number.MAX_SAFE_INTEGER;
+}
+
+export function sortOffers(offers: Offer[], sortBy = "Lowest total cost") {
+  const sorted = [...offers];
+
+  if (sortBy === "Highest trust") {
+    sorted.sort((a, b) => b.trust - a.trust || totalCost(a) - totalCost(b));
+  } else if (sortBy === "Fastest delivery") {
+    sorted.sort((a, b) => etaToScore(a.eta) - etaToScore(b.eta) || totalCost(a) - totalCost(b));
+  } else {
+    sorted.sort((a, b) => totalCost(a) - totalCost(b) || b.trust - a.trust);
+  }
+
+  return sorted.map((offer, index) => ({
+    ...offer,
+    rank: index + 1,
+  }));
+}
+
+export function normalizeMerchant(raw: RawRecord | null | undefined): Merchant | null {
+  if (!raw) return null;
+
+  return {
+    id: String(pickFirst(raw, ["id", "merchant_id"], "")),
+    name: String(pickFirst(raw, ["name", "merchant_name", "seller"], "Merchant")),
+    countryCode: normalizeCountryCode(pickFirst(raw, ["country_code", "country"], "US")),
+    sellerType: normalizeSellerType(pickFirst(raw, ["seller_type", "type"], "independent")),
+    trustScore: toNumber(pickFirst(raw, ["trust_score", "trust", "merchant_trust_score"], 0)),
+    returnPolicy: String(pickFirst(raw, ["return_policy", "returns", "returns_policy"], "Seller policy")),
+    websiteUrl: String(pickFirst(raw, ["website_url", "url", "merchant_url"], "")),
+  };
+}
+
+export function normalizeOffer(raw: RawRecord | null | undefined, referenceCountryCode?: string): Offer | null {
+  if (!raw) return null;
+
+  const merchantSource = (raw.merchants || raw.merchant || raw.merchant_info || null) as RawRecord | null;
+  const merchant = normalizeMerchant(merchantSource);
+  const countryCode = normalizeCountryCode(
+    pickFirst(raw, ["country_code", "offer_country_code", "country"], merchant?.countryCode || "US"),
+  );
+  const sellerType = normalizeSellerType(
+    pickFirst(raw, ["seller_type", "offer_seller_type"], merchant?.sellerType || "independent"),
+  );
+  const trust = toNumber(
+    pickFirst(raw, ["trust_score", "trust", "offer_trust_score"], merchant?.trustScore || 0),
+  );
+
+  return {
+    id: String(pickFirst(raw, ["id", "offer_id"], "")),
+    productId: String(pickFirst(raw, ["product_id", "id_product"], "")),
+    merchantId: String(pickFirst(raw, ["merchant_id"], merchant?.id || "")),
+    seller: String(pickFirst(raw, ["merchant_name", "seller", "seller_name"], merchant?.name || "Merchant")),
+    sellerType,
+    country: String(pickFirst(raw, ["country_name", "country"], countryCode)),
+    countryCode,
+    price: toNumber(pickFirst(raw, ["price", "offer_price", "amount"], 0)),
+    shipping: toNumber(pickFirst(raw, ["shipping_cost", "shipping", "delivery_cost"], 0)),
+    currency: String(pickFirst(raw, ["currency", "currency_code"], "USD")),
+    taxes: String(pickFirst(raw, ["taxes", "tax_note", "taxes_note"], "Calculated at checkout")),
+    eta: String(
+      pickFirst(raw, ["delivery_estimate", "eta", "shipping_window", "estimated_delivery"], "Check merchant"),
+    ),
+    trust,
+    returns: String(
+      pickFirst(raw, ["return_policy", "returns", "returns_policy"], merchant?.returnPolicy || "Seller policy"),
+    ),
+    badge: buildBadge(sellerType, countryCode, referenceCountryCode),
+    urlLabel: sellerType === "Official store" ? "Buy from store" : "View merchant",
+    merchantUrl: String(pickFirst(raw, ["product_url", "merchant_url", "url"], merchant?.websiteUrl || "")),
+    rank: toNumber(pickFirst(raw, ["rank"], 0)),
+    merchant,
+  };
+}
+
+export function normalizeProduct(raw: RawRecord | null | undefined): Product | null {
+  if (!raw) return null;
+
+  const brand = String(pickFirst(raw, ["brand", "product_brand"], ""));
+  const model = String(pickFirst(raw, ["model", "product_model"], ""));
+  const name =
+    String(pickFirst(raw, ["name", "product_name", "title"], "")) ||
+    [brand, model].filter(Boolean).join(" ") ||
+    "Unknown product";
+
+  return {
+    id: String(pickFirst(raw, ["id", "product_id"], "")),
+    name,
+    brand,
+    model,
+    category: String(pickFirst(raw, ["category", "product_category"], "General")),
+    description: String(
+      pickFirst(
+        raw,
+        ["description", "product_description", "summary"],
+        "AI matched the product and ranked merchant offers across countries.",
+      ),
+    ),
+    confidence: toNumber(pickFirst(raw, ["confidence", "match_confidence", "score"], 92)),
+    highlights: toStringArray(
+      pickFirst(raw, ["highlights", "ai_highlights", "key_points"], DEFAULT_HIGHLIGHTS),
+      DEFAULT_HIGHLIGHTS,
+    ),
+    imageUrl: String(pickFirst(raw, ["image_url", "thumbnail_url"], "")),
+  };
+}
+
+export function normalizeSearchResult(raw: RawRecord | null | undefined, referenceCountryCode?: string): SearchResult | null {
+  if (!raw) return null;
+  const product = normalizeProduct(raw);
+  if (!product) return null;
+
+  return {
+    ...product,
+    bestOffer: normalizeOffer(raw, referenceCountryCode),
+  };
+}
+
+export function sellerTypeToDbValue(filter: string) {
+  if (filter === "Official only") return "official";
+  if (filter === "Independent only") return "independent";
+  return null;
+}
+
+export function countryCodeToLabel(code: string) {
+  const normalized = normalizeCountryCode(code);
+  const labels: Record<string, string> = {
+    US: "United States",
+    GB: "United Kingdom",
+    DE: "Germany",
+    CA: "Canada",
+    AU: "Australia",
+    FR: "France",
+  };
+  return labels[normalized] || titleCase(normalized);
+}
+
+FILE: lib/supabase/server.ts
+import { cookies } from "next/headers";
+import { createServerClient } from "@supabase/ssr";
+
+function getSupabaseEnv() {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+
+  if (!url || !anonKey) {
+    throw new Error("Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY");
+  }
+
+  return { url, anonKey };
+}
+
+export function createSupabaseServerClient() {
+  const { url, anonKey } = getSupabaseEnv();
+  const cookieStore = cookies();
+
+  return createServerClient(url, anonKey, {
+    cookies: {
+      get(name: string) {
+        return cookieStore.get(name)?.value;
+      },
+      set(name: string, value: string, options: Record<string, any>) {
+        try {
+          cookieStore.set({ name, value, ...options });
+        } catch {
+          // Route handlers are compatible with writes, while server components may not be.
+        }
+      },
+      remove(name: string, options: Record<string, any>) {
+        try {
+          cookieStore.set({ name, value: "", ...options, maxAge: 0 });
+        } catch {
+          // Best effort cookie cleanup.
+        }
+      },
+    },
+  });
+}
+
+FILE: lib/supabase/browser.ts
+import { createBrowserClient } from "@supabase/ssr";
+
+export function createSupabaseBrowserClient() {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+
+  if (!url || !anonKey) {
+    throw new Error("Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY");
+  }
+
+  return createBrowserClient(url, anonKey);
+}
+
+FILE: app/api/search/route.ts
+import { NextRequest, NextResponse } from "next/server";
+import { normalizeSearchResult } from "lib/market";
+import { createSupabaseServerClient } from "lib/supabase/server";
+
+export async function GET(request: NextRequest) {
+  const searchParams = request.nextUrl.searchParams;
+  const q = searchParams.get("q")?.trim();
+  const country = (searchParams.get("country") || "US").trim().toUpperCase();
+  const sellerType = searchParams.get("sellerType")?.trim() || null;
+
+  if (!q) {
+    return NextResponse.json({ error: "Missing q query parameter." }, { status: 400 });
+  }
+
+  try {
+    const supabase = createSupabaseServerClient();
+    const { data, error } = await supabase.rpc("search_products_with_cheapest_offer", {
+      search_query: q,
+      country_code: country,
+      seller_type: sellerType,
+      result_limit: 20,
+    });
+
+    if (error) {
+      throw error;
+    }
+
+    const results = (data || [])
+      .map((row: Record<string, any>) => normalizeSearchResult(row, country))
+      .filter(Boolean);
+
+    return NextResponse.json({ results });
+  } catch (error: any) {
+    return NextResponse.json(
+      {
+        error: "Failed to search products.",
+        details: error?.message || "Unknown error",
+      },
+      { status: 500 },
+    );
+  }
+}
+
+FILE: app/api/product/[id]/route.ts
+import { NextRequest, NextResponse } from "next/server";
+import { normalizeOffer, normalizeProduct, sortOffers } from "lib/market";
+import { createSupabaseServerClient } from "lib/supabase/server";
+
+export async function GET(
+  request: NextRequest,
+  { params }: { params: { id: string } },
+) {
+  const country = request.nextUrl.searchParams.get("country")?.trim().toUpperCase() || "US";
+  const sellerType = request.nextUrl.searchParams.get("sellerType")?.trim() || null;
+
+  try {
+    const supabase = createSupabaseServerClient();
+    const { data, error } = await supabase.rpc("product_detail_with_offers", {
+      p_product_id: params.id,
+      p_country_code: country,
+      p_seller_type: sellerType,
+    });
+
+    if (error) throw error;
+
+    const payload = Array.isArray(data) ? data[0] : data;
+    const product = normalizeProduct(payload?.product || null);
+
+    if (!product) {
+      return NextResponse.json({ error: "Product not found." }, { status: 404 });
+    }
+
+    const offers = sortOffers(
+      (Array.isArray(payload?.offers) ? payload.offers : [])
+        .map((row: Record<string, any>) => normalizeOffer(row, country))
+        .filter(Boolean),
+    );
+    const bestOffer = normalizeOffer(payload?.best_offer || null, country);
+
+    return NextResponse.json({ product, bestOffer, offers });
+  } catch (error: any) {
+    return NextResponse.json(
+      {
+        error: "Failed to fetch product details.",
+        details: error?.message || "Unknown error",
+      },
+      { status: 500 },
+    );
+  }
+}
+
+FILE: app/api/waitlist/route.ts
+import { NextRequest, NextResponse } from "next/server";
+import { createSupabaseServerClient } from "lib/supabase/server";
+
+function isDuplicateError(error: any) {
+  return error?.code === "23505" || String(error?.message || "").toLowerCase().includes("duplicate");
+}
+
+export async function POST(request: NextRequest) {
+  try {
+    const body = await request.json();
+    const email = String(body?.email || "").trim().toLowerCase();
+    const fullName = String(body?.fullName || "").trim();
+    const role = String(body?.role || "").trim();
+    const message = String(body?.message || "").trim();
+
+    if (!email) {
+      return NextResponse.json({ error: "Email is required." }, { status: 400 });
+    }
+
+    const supabase = createSupabaseServerClient();
+
+    const candidatePayloads = [
+      { email, full_name: fullName, role, message },
+      { email, full_name: fullName, user_type: role, notes: message },
+      { email, name: fullName, role, note: message },
+      { email },
+    ];
+
+    for (const payload of candidatePayloads) {
+      const { error } = await supabase.from("waitlist").insert(payload);
+
+      if (!error) {
+        return NextResponse.json({ ok: true, status: "joined", message: "You're on the list." });
+      }
+
+      if (isDuplicateError(error)) {
+        return NextResponse.json({
+          ok: true,
+          status: "already_joined",
+          message: "You're already on the list.",
+        });
+      }
+    }
+
+    return NextResponse.json(
+      { error: "Unable to save waitlist signup with the current table shape." },
+      { status: 500 },
+    );
+  } catch (error: any) {
+    return NextResponse.json(
+      {
+        error: "Failed to submit waitlist form.",
+        details: error?.message || "Unknown error",
+      },
+      { status: 500 },
+    );
+  }
+}
+
+FILE: app/page.tsx
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
-import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { useEffect, useMemo, useState } from "react";
 import {
   ArrowRight,
   BarChart3,
   Camera,
   CheckCircle2,
-  Clock3,
   Globe,
   Plane,
   ScanLine,
@@ -18,7 +530,7 @@ import {
   Store,
   Zap,
 } from "lucide-react";
-import type { Offer, Product, SearchApiResponse, SearchApiResult } from "lib/market";
+import type { Offer, Product, SearchResult } from "lib/market";
 import { countryCodeToLabel, money, sellerTypeToDbValue, sortOffers, totalCost } from "lib/market";
 
 const pageTabs = ["Home", "Search", "Product", "Compare", "Waitlist"];
@@ -31,28 +543,6 @@ const countryOptions = [
   { label: "France", value: "FR" },
 ];
 const filterOptions = ["All", "Official only", "Independent only", "Cross-border"];
-const emptyStateSuggestions = [
-  "Sony XM5 headphones",
-  "Apple Watch SE",
-  "Canon mirrorless camera",
-];
-const RECENT_SEARCHES_KEY = "twogodeals-recent-searches";
-const EMPTY_SEARCH_RESPONSE: SearchApiResponse = {
-  query: "",
-  normalizedQuery: "",
-  resultCount: 0,
-  filters: { brands: [], categories: [] },
-  results: [],
-};
-
-type SearchResultItem = SearchApiResult;
-
-type RecentSearch = {
-  query: string;
-  country: string;
-  filter: string;
-  createdAt: string;
-};
 
 function SectionTitle({ eyebrow, title, text }: { eyebrow: string; title: string; text: string }) {
   return (
@@ -103,44 +593,6 @@ function Header({ page, setPage }: { page: string; setPage: (page: string) => vo
         </button>
       </div>
     </header>
-  );
-}
-
-function ResultCardSkeleton() {
-  return (
-    <div className="rounded-[24px] border border-white/10 bg-white/5 p-5">
-      <div className="h-5 w-3/4 animate-pulse rounded bg-white/10" />
-      <div className="mt-3 h-4 w-1/2 animate-pulse rounded bg-white/10" />
-      <div className="mt-5 rounded-2xl border border-white/10 bg-slate-900/70 p-3">
-        <div className="h-4 w-1/3 animate-pulse rounded bg-white/10" />
-        <div className="mt-2 h-4 w-1/2 animate-pulse rounded bg-white/10" />
-        <div className="mt-2 h-4 w-1/4 animate-pulse rounded bg-white/10" />
-      </div>
-    </div>
-  );
-}
-
-function OfferCardSkeleton() {
-  return (
-    <div className="rounded-[24px] border border-white/10 bg-white/5 p-5">
-      <div className="flex flex-wrap items-start justify-between gap-4">
-        <div className="min-w-[260px] flex-1">
-          <div className="h-5 w-40 animate-pulse rounded bg-white/10" />
-          <div className="mt-3 h-4 w-56 animate-pulse rounded bg-white/10" />
-          <div className="mt-5 grid gap-2 md:grid-cols-2">
-            {Array.from({ length: 4 }).map((_, index) => (
-              <div key={index} className="h-4 w-full animate-pulse rounded bg-white/10" />
-            ))}
-          </div>
-        </div>
-        <div className="w-40">
-          <div className="ml-auto h-8 w-24 animate-pulse rounded bg-white/10" />
-          <div className="mt-3 ml-auto h-4 w-20 animate-pulse rounded bg-white/10" />
-          <div className="mt-4 h-10 w-full animate-pulse rounded-2xl bg-white/10" />
-          <div className="mt-2 h-10 w-full animate-pulse rounded-2xl bg-white/10" />
-        </div>
-      </div>
-    </div>
   );
 }
 
@@ -332,29 +784,15 @@ function SearchHero({
   setQuery,
   country,
   setCountry,
-  onImmediateSearch,
-  onSuggestionSelect,
-  onRecentSearchSelect,
+  onSearch,
   searchLoading,
-  suggestionLoading,
-  helperText,
-  suggestions,
-  recentSearches,
-  showSuggestions,
 }: {
   query: string;
   setQuery: (value: string) => void;
   country: string;
   setCountry: (value: string) => void;
-  onImmediateSearch: () => void;
-  onSuggestionSelect: (result: SearchResultItem) => void;
-  onRecentSearchSelect: (item: RecentSearch) => void;
+  onSearch: () => void;
   searchLoading: boolean;
-  suggestionLoading: boolean;
-  helperText?: string;
-  suggestions: SearchResultItem[];
-  recentSearches: RecentSearch[];
-  showSuggestions: boolean;
 }) {
   return (
     <div className="rounded-[32px] border border-white/10 bg-white/5 p-4 shadow-2xl shadow-cyan-950/30 backdrop-blur-xl">
@@ -378,10 +816,10 @@ function SearchHero({
             value={query}
             onChange={(event) => setQuery(event.target.value)}
             onKeyDown={(event) => {
-              if (event.key === "Enter") onImmediateSearch();
+              if (event.key === "Enter") onSearch();
             }}
             className="rounded-2xl border border-white/10 bg-slate-950 px-4 py-3 text-white outline-none placeholder:text-slate-500"
-            placeholder="Search any product, SKU, model, or category"
+            placeholder="Search any product, SKU, or model"
           />
           <select
             value={country}
@@ -395,84 +833,13 @@ function SearchHero({
             ))}
           </select>
           <button
-            onClick={onImmediateSearch}
+            onClick={onSearch}
             disabled={searchLoading}
             className="rounded-2xl bg-white px-5 py-3 font-medium text-slate-950 transition hover:scale-[1.02] disabled:cursor-not-allowed disabled:opacity-60"
           >
             {searchLoading ? "Searching..." : "Start AI search"}
           </button>
         </div>
-        <div className="mt-3 text-sm text-slate-400">
-          {helperText || "Search updates while you type. Press Enter for an immediate full search."}
-        </div>
-
-        {showSuggestions && (
-          <div className="mt-4 rounded-[24px] border border-white/10 bg-slate-950/80 p-3">
-            <div className="mb-3 flex items-center gap-2 text-xs uppercase tracking-[0.24em] text-cyan-200/80">
-              <Sparkles className="h-3.5 w-3.5" />
-              Live suggestions
-            </div>
-            {suggestionLoading ? (
-              <div className="grid gap-2">
-                {Array.from({ length: 3 }).map((_, index) => (
-                  <div key={index} className="rounded-2xl border border-white/10 bg-white/5 p-3">
-                    <div className="h-4 w-1/2 animate-pulse rounded bg-white/10" />
-                    <div className="mt-2 h-3 w-1/3 animate-pulse rounded bg-white/10" />
-                  </div>
-                ))}
-              </div>
-            ) : suggestions.length > 0 ? (
-              <div className="grid gap-2">
-                {suggestions.slice(0, 6).map((result) => (
-                  <button
-                    key={result.id}
-                    onClick={() => onSuggestionSelect(result)}
-                    className="rounded-2xl border border-white/10 bg-white/5 p-3 text-left transition hover:bg-white/10"
-                  >
-                    <div className="flex items-start justify-between gap-3">
-                      <div>
-                        <div className="font-medium text-white">{result.productSummary.title}</div>
-                        <div className="mt-1 text-sm text-slate-400">{result.productSummary.subtitle}</div>
-                      </div>
-                      <div className="rounded-full border border-cyan-400/20 bg-cyan-400/10 px-2 py-1 text-[11px] text-cyan-100">
-                        {result.matchType.replaceAll("_", " ")}
-                      </div>
-                    </div>
-                    {result.bestOffer && (
-                      <div className="mt-2 text-sm text-slate-300">
-                        {result.bestOffer.seller} • {money(result.bestOffer.totalVisibleCost, result.bestOffer.currency)}
-                      </div>
-                    )}
-                  </button>
-                ))}
-              </div>
-            ) : (
-              <div className="rounded-2xl border border-dashed border-white/10 bg-white/5 p-4 text-sm text-slate-300">
-                Keep typing to see product suggestions.
-              </div>
-            )}
-          </div>
-        )}
-
-        {recentSearches.length > 0 && query.trim().length < 2 && (
-          <div className="mt-4">
-            <div className="mb-3 flex items-center gap-2 text-xs uppercase tracking-[0.24em] text-slate-400">
-              <Clock3 className="h-3.5 w-3.5" />
-              Recent searches
-            </div>
-            <div className="flex flex-wrap gap-2">
-              {recentSearches.map((item) => (
-                <button
-                  key={`${item.query}-${item.country}-${item.createdAt}`}
-                  onClick={() => onRecentSearchSelect(item)}
-                  className="rounded-full border border-white/10 bg-white/5 px-3 py-2 text-sm text-slate-200 transition hover:bg-white/10"
-                >
-                  {item.query} • {item.country}
-                </button>
-              ))}
-            </div>
-          </div>
-        )}
       </div>
     </div>
   );
@@ -483,13 +850,8 @@ function HomePage({
   setQuery,
   country,
   setCountry,
-  onImmediateSearch,
-  onSuggestionSelect,
-  onRecentSearchSelect,
+  onSearch,
   searchLoading,
-  suggestionLoading,
-  suggestions,
-  recentSearches,
   featuredProduct,
   featuredLoading,
   featuredError,
@@ -499,13 +861,8 @@ function HomePage({
   setQuery: (value: string) => void;
   country: string;
   setCountry: (value: string) => void;
-  onImmediateSearch: () => void;
-  onSuggestionSelect: (result: SearchResultItem) => void;
-  onRecentSearchSelect: (item: RecentSearch) => void;
+  onSearch: () => void;
   searchLoading: boolean;
-  suggestionLoading: boolean;
-  suggestions: SearchResultItem[];
-  recentSearches: RecentSearch[];
   featuredProduct: { product: Product; offers: Offer[] } | null;
   featuredLoading: boolean;
   featuredError: string;
@@ -544,7 +901,7 @@ function HomePage({
               Search smarter. Compare real prices. Buy from the best store.
             </h1>
             <p className="mt-6 max-w-2xl text-lg leading-8 text-slate-300 md:text-xl">
-              2GoDeals AI turns product discovery into an intelligent shopping workflow with live Supabase search, autocomplete suggestions, and dynamic ranking that feels like a real shopping engine.
+              2GoDeals AI turns product discovery into an intelligent shopping workflow with live Supabase search, merchant ranking, and direct waitlist capture.
             </p>
             <div className="mt-8">
               <SearchHero
@@ -552,29 +909,22 @@ function HomePage({
                 setQuery={setQuery}
                 country={country}
                 setCountry={setCountry}
-                onImmediateSearch={onImmediateSearch}
-                onSuggestionSelect={onSuggestionSelect}
-                onRecentSearchSelect={onRecentSearchSelect}
+                onSearch={onSearch}
                 searchLoading={searchLoading}
-                suggestionLoading={suggestionLoading}
-                suggestions={suggestions}
-                recentSearches={recentSearches}
-                showSuggestions={query.trim().length >= 2}
-                helperText="Type to preview live autocomplete suggestions instantly. Press Enter to run the full search."
               />
             </div>
             <div className="mt-8 grid gap-3 text-sm text-slate-300 sm:grid-cols-3">
               <div className="flex items-center gap-2">
                 <CheckCircle2 className="h-4 w-4 text-emerald-300" />
-                Live autocomplete RPC
+                Live product search API
               </div>
               <div className="flex items-center gap-2">
                 <CheckCircle2 className="h-4 w-4 text-emerald-300" />
-                URL-driven full search state
+                Cross-country offer comparison
               </div>
               <div className="flex items-center gap-2">
                 <CheckCircle2 className="h-4 w-4 text-emerald-300" />
-                Dynamic merchant ranking
+                Direct-to-merchant handoff
               </div>
             </div>
           </div>
@@ -584,14 +934,8 @@ function HomePage({
               <div className="rounded-[28px] border border-white/10 bg-slate-900/90 p-5">
                 <div className="text-sm uppercase tracking-[0.24em] text-cyan-200/80">AI preview</div>
                 {featuredLoading ? (
-                  <div className="mt-5 space-y-3">
-                    {Array.from({ length: 3 }).map((_, index) => (
-                      <div key={index} className="rounded-2xl border border-white/10 bg-white/5 p-4">
-                        <div className="h-5 w-1/2 animate-pulse rounded bg-white/10" />
-                        <div className="mt-3 h-4 w-1/3 animate-pulse rounded bg-white/10" />
-                        <div className="mt-4 h-16 animate-pulse rounded bg-white/10" />
-                      </div>
-                    ))}
+                  <div className="mt-5 rounded-2xl border border-white/10 bg-white/5 p-6 text-slate-300">
+                    Loading live product data...
                   </div>
                 ) : featuredError ? (
                   <div className="mt-5 rounded-2xl border border-rose-400/20 bg-rose-400/10 p-6 text-rose-100">
@@ -637,7 +981,7 @@ function HomePage({
                   </>
                 ) : (
                   <div className="mt-5 rounded-2xl border border-dashed border-white/10 bg-white/5 p-6 text-slate-300">
-                    Start typing to preview live product matches and top offers here.
+                    Search for a product to start seeing live merchant offers here.
                   </div>
                 )}
               </div>
@@ -669,10 +1013,10 @@ function HomePage({
             <SectionTitle
               eyebrow="Product Flow"
               title="Search, rank, compare, and buy in one system"
-              text="Autocomplete now uses the live Supabase suggestion RPC, full results use the search RPC, and the page keeps URL-driven state without losing the premium shopping feel."
+              text="The backend now resolves live search results, product detail pages, related offers, and waitlist capture using your Supabase project."
             />
             <div className="mt-8 flex flex-wrap gap-3">
-              <button onClick={onImmediateSearch} className="rounded-2xl bg-white px-5 py-3 font-medium text-slate-950">
+              <button onClick={onSearch} className="rounded-2xl bg-white px-5 py-3 font-medium text-slate-950">
                 Try live search
               </button>
               <button
@@ -685,8 +1029,8 @@ function HomePage({
           </div>
           <div className="grid gap-4">
             {[
-              { icon: Zap, title: "Instant suggestions", text: "Autocomplete products appear while shoppers type without interrupting the main layout." },
-              { icon: BarChart3, title: "Dedicated full search", text: "Press Enter or click search to run the richer result-ranking RPC." },
+              { icon: Zap, title: "AI match engine", text: "Recognizes product names, variants, and seller naming differences." },
+              { icon: BarChart3, title: "Price intelligence", text: "Ranks by visible total, not just item price alone." },
               { icon: Store, title: "Merchant transparency", text: "Shows official stores, private sellers, returns, and trust." },
               { icon: Plane, title: "Cross-border ready", text: "Helps shoppers compare international offers faster." },
             ].map((item) => {
@@ -710,10 +1054,10 @@ function HomePage({
       <section className="mx-auto max-w-7xl px-6 py-16 md:px-10 lg:px-12">
         <div className="grid gap-6 md:grid-cols-4">
           {[
-            ["Live", "autocomplete while typing"],
-            ["Search", "URL-driven full results"],
-            ["Filterable", "by country, seller, brand, and category"],
-            ["Premium", "kept visually intact"],
+            ["Live", "Supabase-backed search"],
+            ["4", "Vercel-compatible API routes"],
+            ["20+", "merchant data points per offer"],
+            ["1", "premium AI shopping experience"],
           ].map(([value, label]) => (
             <div key={label} className="rounded-[24px] border border-white/10 bg-white/5 p-6">
               <div className="text-4xl font-bold tracking-tight">{value}</div>
@@ -731,17 +1075,10 @@ function SearchPage({
   setQuery,
   country,
   setCountry,
-  onImmediateSearch,
-  onSuggestionSelect,
-  onRecentSearchSelect,
+  onSearch,
   searchLoading,
-  suggestionLoading,
   searchError,
-  searchTouched,
-  searchMeta,
-  suggestions,
-  recentSearches,
-  filteredResults,
+  searchResults,
   selectedProductId,
   setSelectedProductId,
   product,
@@ -752,10 +1089,6 @@ function SearchPage({
   setSortBy,
   filter,
   setFilter,
-  brandFilter,
-  setBrandFilter,
-  categoryFilter,
-  setCategoryFilter,
   setPage,
   onOpenMerchant,
   onViewMerchant,
@@ -764,17 +1097,10 @@ function SearchPage({
   setQuery: (value: string) => void;
   country: string;
   setCountry: (value: string) => void;
-  onImmediateSearch: () => void;
-  onSuggestionSelect: (result: SearchResultItem) => void;
-  onRecentSearchSelect: (item: RecentSearch) => void;
+  onSearch: () => void;
   searchLoading: boolean;
-  suggestionLoading: boolean;
   searchError: string;
-  searchTouched: boolean;
-  searchMeta: SearchApiResponse;
-  suggestions: SearchResultItem[];
-  recentSearches: RecentSearch[];
-  filteredResults: SearchResultItem[];
+  searchResults: SearchResult[];
   selectedProductId: string;
   setSelectedProductId: (value: string) => void;
   product: Product | null;
@@ -785,10 +1111,6 @@ function SearchPage({
   setSortBy: (value: string) => void;
   filter: string;
   setFilter: (value: string) => void;
-  brandFilter: string;
-  setBrandFilter: (value: string) => void;
-  categoryFilter: string;
-  setCategoryFilter: (value: string) => void;
   setPage: (page: string) => void;
   onOpenMerchant: (offer: Offer) => void;
   onViewMerchant: (offer: Offer) => void;
@@ -807,8 +1129,8 @@ function SearchPage({
         title={product?.name || "Search live products"}
         text={
           product
-            ? `AI matched this product with ${product.confidence}% confidence and ranked offers by match quality, visible total cost, trust, and delivery speed.`
-            : "Autocomplete suggestions help narrow intent first, then the full search RPC returns ranked shopping results with stable filters and selection state."
+            ? `AI matched this product with ${product.confidence}% confidence and ranked offers by visible total cost, trust, delivery speed, and store type.`
+            : "Run a search to load live product matches and ranked offers from Supabase."
         }
       />
 
@@ -818,19 +1140,8 @@ function SearchPage({
           setQuery={setQuery}
           country={country}
           setCountry={setCountry}
-          onImmediateSearch={onImmediateSearch}
-          onSuggestionSelect={onSuggestionSelect}
-          onRecentSearchSelect={onRecentSearchSelect}
+          onSearch={onSearch}
           searchLoading={searchLoading}
-          suggestionLoading={suggestionLoading}
-          suggestions={suggestions}
-          recentSearches={recentSearches}
-          showSuggestions={query.trim().length >= 2}
-          helperText={
-            searchLoading
-              ? "Running full search against live product data..."
-              : `Results: ${searchMeta.resultCount} • Normalized query: ${searchMeta.normalizedQuery || "n/a"}`
-          }
         />
       </div>
 
@@ -840,11 +1151,49 @@ function SearchPage({
         </div>
       )}
 
+      {searchResults.length > 0 && (
+        <div className="mt-8">
+          <div className="mb-3 text-sm uppercase tracking-[0.24em] text-slate-400">Matched products</div>
+          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+            {searchResults.map((result) => (
+              <button
+                key={result.id}
+                onClick={() => setSelectedProductId(result.id)}
+                className={`rounded-[24px] border p-5 text-left transition ${
+                  selectedProductId === result.id
+                    ? "border-cyan-400/40 bg-cyan-400/10"
+                    : "border-white/10 bg-white/5 hover:bg-white/10"
+                }`}
+              >
+                <div className="text-lg font-semibold">{result.name}</div>
+                <div className="mt-2 text-sm text-slate-400">
+                  {result.brand || "Brand unknown"} • {result.category}
+                </div>
+                {result.bestOffer && (
+                  <div className="mt-4 rounded-2xl border border-white/10 bg-slate-900/70 p-3 text-sm text-slate-200">
+                    <div>{result.bestOffer.seller}</div>
+                    <div className="mt-1 text-slate-400">
+                      {money(totalCost(result.bestOffer), result.bestOffer.currency)} total visible cost
+                    </div>
+                  </div>
+                )}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {!searchLoading && !searchError && searchResults.length === 0 && (
+        <div className="mt-8 rounded-[24px] border border-dashed border-white/10 bg-white/5 p-8 text-slate-300">
+          No products matched your search yet. Try a broader query, another country, or a model number.
+        </div>
+      )}
+
       <div className="mt-8 grid gap-8 lg:grid-cols-[320px_1fr]">
         <aside className="h-fit rounded-[28px] border border-white/10 bg-white/5 p-5">
           <div className="text-lg font-semibold">AI filters</div>
           <div className="mt-5">
-            <label className="mb-2 block text-sm text-slate-300">Sort offers by</label>
+            <label className="mb-2 block text-sm text-slate-300">Sort by</label>
             <select
               value={sortBy}
               onChange={(event) => setSortBy(event.target.value)}
@@ -856,7 +1205,7 @@ function SearchPage({
             </select>
           </div>
           <div className="mt-5">
-            <label className="mb-2 block text-sm text-slate-300">Seller filter</label>
+            <label className="mb-2 block text-sm text-slate-300">Store filter</label>
             <div className="flex flex-wrap gap-2">
               {filterOptions.map((option) => (
                 <button
@@ -885,107 +1234,14 @@ function SearchPage({
               ))}
             </select>
           </div>
-          <div className="mt-5">
-            <label className="mb-2 block text-sm text-slate-300">Brand</label>
-            <select
-              value={brandFilter}
-              onChange={(event) => setBrandFilter(event.target.value)}
-              className="w-full rounded-2xl border border-white/10 bg-slate-900 px-3 py-3 text-white outline-none"
-            >
-              <option value="All brands">All brands</option>
-              {searchMeta.filters.brands.map((brand) => (
-                <option key={brand} value={brand}>
-                  {brand}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div className="mt-5">
-            <label className="mb-2 block text-sm text-slate-300">Category</label>
-            <select
-              value={categoryFilter}
-              onChange={(event) => setCategoryFilter(event.target.value)}
-              className="w-full rounded-2xl border border-white/10 bg-slate-900 px-3 py-3 text-white outline-none"
-            >
-              <option value="All categories">All categories</option>
-              {searchMeta.filters.categories.map((category) => (
-                <option key={category} value={category}>
-                  {category}
-                </option>
-              ))}
-            </select>
-          </div>
           {best && (
             <div className="mt-6 rounded-2xl border border-emerald-400/20 bg-emerald-400/10 p-4 text-sm text-emerald-100">
-              AI best offer right now: {best.seller} at {money(totalCost(best), best.currency)} visible total cost.
+              AI best match right now: {best.seller} at {money(totalCost(best), best.currency)} visible total cost.
             </div>
           )}
         </aside>
 
         <div>
-          {searchMeta.resultCount > 0 && (
-            <div className="mb-5">
-              <div className="mb-3 flex flex-wrap items-center justify-between gap-3 text-sm text-slate-400">
-                <div className="uppercase tracking-[0.24em]">Matched products</div>
-                <div>
-                  {filteredResults.length} shown of {searchMeta.resultCount} results
-                </div>
-              </div>
-              <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-                {searchLoading
-                  ? Array.from({ length: 3 }).map((_, index) => <ResultCardSkeleton key={index} />)
-                  : filteredResults.map((result) => (
-                      <button
-                        key={result.id}
-                        onClick={() => setSelectedProductId(result.id)}
-                        className={`rounded-[24px] border p-5 text-left transition ${
-                          selectedProductId === result.id
-                            ? "border-cyan-400/40 bg-cyan-400/10"
-                            : "border-white/10 bg-white/5 hover:bg-white/10"
-                        }`}
-                      >
-                        <div className="flex items-start justify-between gap-3">
-                          <div className="text-lg font-semibold">{result.productSummary.title}</div>
-                          <div className="rounded-full border border-cyan-400/20 bg-cyan-400/10 px-2 py-1 text-xs text-cyan-100">
-                            {result.matchType.replaceAll("_", " ")}
-                          </div>
-                        </div>
-                        <div className="mt-2 text-sm text-slate-400">{result.productSummary.subtitle || "Matched product"}</div>
-                        {result.bestOffer && (
-                          <div className="mt-4 rounded-2xl border border-white/10 bg-slate-900/70 p-3 text-sm text-slate-200">
-                            <div className="font-medium">{result.bestOffer.seller}</div>
-                            <div className="mt-1 text-slate-400">
-                              {money(result.bestOffer.totalVisibleCost, result.bestOffer.currency)} total visible cost
-                            </div>
-                            <div className="mt-1 text-slate-500">
-                              Trust {result.bestOffer.trust}/100 • ETA {result.bestOffer.eta}
-                            </div>
-                          </div>
-                        )}
-                      </button>
-                    ))}
-              </div>
-            </div>
-          )}
-
-          {searchTouched && !searchLoading && !searchError && searchMeta.resultCount === 0 && (
-            <div className="mb-8 rounded-[24px] border border-dashed border-white/10 bg-white/5 p-8 text-slate-300">
-              <div className="text-lg font-semibold text-white">No products matched yet</div>
-              <div className="mt-2">Try another brand, a shorter model fragment, or a broader category search.</div>
-              <div className="mt-5 flex flex-wrap gap-2">
-                {emptyStateSuggestions.map((suggestion) => (
-                  <button
-                    key={suggestion}
-                    onClick={() => setQuery(suggestion)}
-                    className="rounded-full border border-white/10 bg-white/5 px-3 py-2 text-sm text-slate-200 transition hover:bg-white/10"
-                  >
-                    {suggestion}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-
           {product && (
             <div className="mb-5 grid gap-4 md:grid-cols-3">
               <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
@@ -1006,10 +1262,8 @@ function SearchPage({
           )}
 
           {offersLoading ? (
-            <div className="space-y-4">
-              {Array.from({ length: 3 }).map((_, index) => (
-                <OfferCardSkeleton key={index} />
-              ))}
+            <div className="rounded-2xl border border-white/10 bg-white/5 p-8 text-slate-300">
+              Loading ranked offers...
             </div>
           ) : offersError ? (
             <div className="rounded-2xl border border-rose-400/20 bg-rose-400/10 p-8 text-rose-100">
@@ -1028,7 +1282,7 @@ function SearchPage({
             </div>
           ) : (
             <div className="rounded-2xl border border-dashed border-white/10 bg-white/5 p-8 text-slate-300">
-              No offers match the current filters. Try changing seller type or country.
+              No offers match the current filters. Try changing country or seller type.
             </div>
           )}
 
@@ -1085,6 +1339,9 @@ function ProductPage({ product, offers, setPage }: { product: Product | null; of
               <div className="mt-2 font-semibold">{product.confidence}%</div>
             </div>
           </div>
+          <div className="mt-6 rounded-2xl border border-white/10 bg-slate-900/70 p-4 text-sm text-slate-300">
+            {offers.length} live offers currently loaded from the backend for this product.
+          </div>
         </div>
         <div className="rounded-[28px] border border-white/10 bg-white/5 p-6">
           <div className="text-sm text-slate-400">Why this product matched</div>
@@ -1095,9 +1352,6 @@ function ProductPage({ product, offers, setPage }: { product: Product | null; of
                 <div className="text-slate-200">{item}</div>
               </div>
             ))}
-          </div>
-          <div className="mt-6 rounded-2xl border border-white/10 bg-slate-900/70 p-4 text-sm text-slate-300">
-            {offers.length} live offers currently loaded from the backend for this product.
           </div>
           <button onClick={() => setPage("Compare")} className="mt-6 rounded-2xl bg-white px-5 py-3 font-medium text-slate-950">
             See comparison engine
@@ -1303,52 +1557,17 @@ function Footer() {
   );
 }
 
-function readRecentSearches() {
-  if (typeof window === "undefined") return [];
-
-  try {
-    const raw = window.localStorage.getItem(RECENT_SEARCHES_KEY);
-    const parsed = raw ? (JSON.parse(raw) as RecentSearch[]) : [];
-    return Array.isArray(parsed) ? parsed.slice(0, 6) : [];
-  } catch {
-    return [];
-  }
-}
-
-function writeRecentSearches(items: RecentSearch[]) {
-  if (typeof window === "undefined") return;
-  window.localStorage.setItem(RECENT_SEARCHES_KEY, JSON.stringify(items.slice(0, 6)));
-}
-
 export default function TwoGoDealsMVP() {
-  const router = useRouter();
-  const pathname = usePathname();
-  const searchParams = useSearchParams();
+  const [page, setPage] = useState("Home");
+  const [query, setQuery] = useState("Sony WH-1000XM6");
+  const [country, setCountry] = useState("US");
+  const [sortBy, setSortBy] = useState("Lowest total cost");
+  const [filter, setFilter] = useState("All");
 
-  const initialPage = searchParams.get("view");
-  const initialQuery = searchParams.get("q");
-  const initialCountry = searchParams.get("country");
-  const initialFilter = searchParams.get("seller");
-  const initialBrand = searchParams.get("brand");
-  const initialCategory = searchParams.get("category");
-  const initialSort = searchParams.get("sort");
-
-  const [page, setPage] = useState(pageTabs.includes(initialPage || "") ? (initialPage as string) : "Home");
-  const [query, setQuery] = useState(initialQuery || "Sony WH-1000XM6");
-  const [country, setCountry] = useState(initialCountry || "US");
-  const [sortBy, setSortBy] = useState(initialSort || "Lowest total cost");
-  const [filter, setFilter] = useState(filterOptions.includes(initialFilter || "") ? (initialFilter as string) : "All");
-  const [brandFilter, setBrandFilter] = useState(initialBrand || "All brands");
-  const [categoryFilter, setCategoryFilter] = useState(initialCategory || "All categories");
-
-  const [searchTouched, setSearchTouched] = useState(false);
   const [searchLoading, setSearchLoading] = useState(false);
-  const [suggestionLoading, setSuggestionLoading] = useState(false);
   const [searchError, setSearchError] = useState("");
-  const [searchMeta, setSearchMeta] = useState<SearchApiResponse>(EMPTY_SEARCH_RESPONSE);
-  const [suggestionMeta, setSuggestionMeta] = useState<SearchApiResponse>(EMPTY_SEARCH_RESPONSE);
+  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [selectedProductId, setSelectedProductId] = useState("");
-  const [recentSearches, setRecentSearches] = useState<RecentSearch[]>([]);
 
   const [productLoading, setProductLoading] = useState(false);
   const [productError, setProductError] = useState("");
@@ -1365,263 +1584,25 @@ export default function TwoGoDealsMVP() {
   const [merchantOffer, setMerchantOffer] = useState<Offer | null>(null);
   const [merchantDetailsOffer, setMerchantDetailsOffer] = useState<Offer | null>(null);
 
-  const searchRequestId = useRef(0);
-  const suggestionRequestId = useRef(0);
-  const hasInitializedRecentSearches = useRef(false);
-  const hasMountedUrlSync = useRef(false);
-
-  const filteredResults = useMemo(() => {
-    return searchMeta.results.filter((result) => {
-      if (brandFilter !== "All brands" && result.brand !== brandFilter) return false;
-      if (categoryFilter !== "All categories" && result.category !== categoryFilter) return false;
-      return true;
-    });
-  }, [brandFilter, categoryFilter, searchMeta.results]);
-
-  function buildSearchParams(nextPage = page) {
-    const params = new URLSearchParams();
-
-    if (nextPage !== "Home") params.set("view", nextPage);
-    if (query.trim()) params.set("q", query.trim());
-    if (country !== "US") params.set("country", country);
-    if (filter !== "All") params.set("seller", filter);
-    if (brandFilter !== "All brands") params.set("brand", brandFilter);
-    if (categoryFilter !== "All categories") params.set("category", categoryFilter);
-    if (sortBy !== "Lowest total cost") params.set("sort", sortBy);
-
-    return params.toString();
-  }
-
-  function persistRecentSearch(currentQuery: string, currentCountry: string, currentFilter: string) {
-    const nextEntry: RecentSearch = {
-      query: currentQuery,
-      country: currentCountry,
-      filter: currentFilter,
-      createdAt: new Date().toISOString(),
-    };
-
-    const merged = [
-      nextEntry,
-      ...recentSearches.filter(
-        (item) =>
-          item.query.toLowerCase() !== currentQuery.toLowerCase() ||
-          item.country !== currentCountry ||
-          item.filter !== currentFilter,
-      ),
-    ].slice(0, 6);
-
-    setRecentSearches(merged);
-    writeRecentSearches(merged);
-  }
-
-  async function runSearch(options?: {
-    navigateToSearch?: boolean;
-    sourceQuery?: string;
-    sourceCountry?: string;
-    sourceFilter?: string;
-    preselectId?: string;
-  }) {
-    const currentQuery = (options?.sourceQuery ?? query).trim();
-    const currentCountry = options?.sourceCountry ?? country;
-    const currentFilter = options?.sourceFilter ?? filter;
-    const navigateToSearch = Boolean(options?.navigateToSearch);
-
-    if (!currentQuery) {
-      setSearchTouched(true);
-      setSearchMeta(EMPTY_SEARCH_RESPONSE);
-      setSelectedProductId("");
-      if (navigateToSearch) setPage("Search");
-      return;
-    }
-
-    const requestId = ++searchRequestId.current;
-    setSearchTouched(true);
-    setSearchLoading(true);
-    setSearchError("");
-
-    try {
-      const params = new URLSearchParams({
-        q: currentQuery,
-        country: currentCountry,
-        mode: "search",
-        limit: "20",
-      });
-
-      const sellerType = sellerTypeToDbValue(currentFilter);
-      if (sellerType) params.set("sellerType", sellerType);
-
-      const response = await fetch(`/api/search?${params.toString()}`);
-      const payload = (await response.json()) as SearchApiResponse & { error?: string };
-
-      if (!response.ok) {
-        throw new Error(payload.error || "Failed to run search.");
-      }
-
-      if (requestId !== searchRequestId.current) return;
-
-      setSearchMeta(payload);
-      persistRecentSearch(currentQuery, currentCountry, currentFilter);
-
-      const nextSelectedId =
-        (options?.preselectId && payload.results.some((result) => result.id === options.preselectId) && options.preselectId) ||
-        (selectedProductId && payload.results.some((result) => result.id === selectedProductId) && selectedProductId) ||
-        payload.results[0]?.id ||
-        "";
-
-      setSelectedProductId(nextSelectedId);
-
-      if (navigateToSearch) setPage("Search");
-    } catch (error: any) {
-      if (requestId !== searchRequestId.current) return;
-
-      setSearchMeta({
-        ...EMPTY_SEARCH_RESPONSE,
-        query: currentQuery,
-      });
-      setSelectedProductId("");
-      setSearchError(error?.message || "Search failed.");
-      if (navigateToSearch) setPage("Search");
-    } finally {
-      if (requestId === searchRequestId.current) {
-        setSearchLoading(false);
-      }
-    }
-  }
-
-  function handleSuggestionSelect(result: SearchResultItem) {
-    setQuery(result.name);
-    runSearch({
-      navigateToSearch: true,
-      sourceQuery: result.name,
-      sourceCountry: country,
-      sourceFilter: filter,
-      preselectId: result.id,
-    });
-  }
-
-  function handleRecentSearchSelect(item: RecentSearch) {
-    setQuery(item.query);
-    setCountry(item.country);
-    setFilter(item.filter);
-    runSearch({
-      navigateToSearch: true,
-      sourceQuery: item.query,
-      sourceCountry: item.country,
-      sourceFilter: item.filter,
-    });
-  }
-
-  function handleImmediateSearch() {
-    runSearch({ navigateToSearch: true });
-  }
-
   useEffect(() => {
-    if (hasInitializedRecentSearches.current) return;
-    hasInitializedRecentSearches.current = true;
-    setRecentSearches(readRecentSearches());
-  }, []);
+    let cancelled = false;
 
-  useEffect(() => {
-    if (!hasMountedUrlSync.current) {
-      hasMountedUrlSync.current = true;
-      return;
-    }
-
-    const nextQueryString = buildSearchParams();
-    router.replace(nextQueryString ? `${pathname}?${nextQueryString}` : pathname, { scroll: false });
-  }, [brandFilter, categoryFilter, country, filter, page, pathname, query, router, sortBy]);
-
-  useEffect(() => {
-    const trimmed = query.trim();
-
-    if (trimmed.length < 2) {
-      setSuggestionMeta(EMPTY_SEARCH_RESPONSE);
-      setSuggestionLoading(false);
-      return;
-    }
-
-    const timeout = window.setTimeout(async () => {
-      const requestId = ++suggestionRequestId.current;
-      setSuggestionLoading(true);
-
-      try {
-        const params = new URLSearchParams({
-          q: trimmed,
-          country,
-          mode: "autocomplete",
-          limit: "8",
-        });
-
-        const sellerType = sellerTypeToDbValue(filter);
-        if (sellerType) params.set("sellerType", sellerType);
-
-        const response = await fetch(`/api/search?${params.toString()}`);
-        const payload = (await response.json()) as SearchApiResponse & { error?: string };
-
-        if (!response.ok) {
-          throw new Error(payload.error || "Failed to load suggestions.");
-        }
-
-        if (requestId === suggestionRequestId.current) {
-          setSuggestionMeta(payload);
-        }
-      } catch {
-        if (requestId === suggestionRequestId.current) {
-          setSuggestionMeta(EMPTY_SEARCH_RESPONSE);
-        }
-      } finally {
-        if (requestId === suggestionRequestId.current) {
-          setSuggestionLoading(false);
-        }
-      }
-    }, 250);
-
-    return () => window.clearTimeout(timeout);
-  }, [country, filter, query]);
-
-  useEffect(() => {
-    const trimmed = query.trim();
-    if (page !== "Search" || trimmed.length < 2) return;
-
-    const timeout = window.setTimeout(() => {
-      runSearch();
-    }, 450);
-
-    return () => window.clearTimeout(timeout);
-  }, [country, filter, page, query]);
-
-  useEffect(() => {
-    const trimmed = query.trim();
-    const timeout = window.setTimeout(async () => {
-      if (trimmed.length < 2) {
-        setFeaturedLoading(false);
-        setFeaturedError("");
-        setFeaturedProduct(null);
-        return;
-      }
-
+    async function loadFeatured() {
       setFeaturedLoading(true);
       setFeaturedError("");
 
       try {
-        const params = new URLSearchParams({
-          q: trimmed,
-          country,
-          mode: "search",
-          limit: "3",
-        });
+        const searchResponse = await fetch(`/api/search?q=${encodeURIComponent(query)}&country=${country}`);
+        const searchPayload = await searchResponse.json();
 
-        const response = await fetch(`/api/search?${params.toString()}`);
-        const payload = (await response.json()) as SearchApiResponse & { error?: string };
-
-        if (!response.ok) {
-          throw new Error(payload.error || "Failed to load featured search.");
+        if (!searchResponse.ok) {
+          throw new Error(searchPayload.error || "Failed to load featured search.");
         }
 
-        const first = payload.results[0];
+        const first = searchPayload.results?.[0];
+
         if (!first?.id) {
-          setFeaturedProduct(null);
-          setFeaturedLoading(false);
+          if (!cancelled) setFeaturedProduct(null);
           return;
         }
 
@@ -1632,31 +1613,27 @@ export default function TwoGoDealsMVP() {
           throw new Error(productPayload.error || "Failed to load featured product.");
         }
 
-        setFeaturedProduct({
-          product: productPayload.product,
-          offers: productPayload.offers || [],
-        });
+        if (!cancelled) {
+          setFeaturedProduct({
+            product: productPayload.product,
+            offers: productPayload.offers || [],
+          });
+        }
       } catch (error: any) {
-        setFeaturedError(error?.message || "Unable to load featured live data right now.");
+        if (!cancelled) {
+          setFeaturedError(error?.message || "Unable to load featured live data right now.");
+        }
       } finally {
-        setFeaturedLoading(false);
+        if (!cancelled) setFeaturedLoading(false);
       }
-    }, 450);
-
-    return () => window.clearTimeout(timeout);
-  }, [country, query]);
-
-  useEffect(() => {
-    if (!selectedProductId) {
-      setProduct(null);
-      setOffers([]);
-      return;
     }
 
-    if (!filteredResults.some((result) => result.id === selectedProductId)) {
-      setSelectedProductId(filteredResults[0]?.id || "");
-    }
-  }, [filteredResults, selectedProductId]);
+    loadFeatured();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     if (!selectedProductId) {
@@ -1669,9 +1646,13 @@ export default function TwoGoDealsMVP() {
 
     async function loadProductDetail() {
       const sellerType = sellerTypeToDbValue(filter);
-      const params = new URLSearchParams({ country });
+      const params = new URLSearchParams({
+        country,
+      });
 
-      if (sellerType) params.set("sellerType", sellerType);
+      if (sellerType) {
+        params.set("sellerType", sellerType);
+      }
 
       setProductLoading(true);
       setOffersLoading(true);
@@ -1712,6 +1693,42 @@ export default function TwoGoDealsMVP() {
     };
   }, [country, filter, selectedProductId]);
 
+  async function handleSearch() {
+    if (!query.trim()) {
+      setSearchError("Enter a product name, SKU, or model number to search.");
+      setPage("Search");
+      return;
+    }
+
+    setSearchLoading(true);
+    setSearchError("");
+    setProductError("");
+    setOffersError("");
+    setFilter("All");
+    setSortBy("Lowest total cost");
+
+    try {
+      const response = await fetch(`/api/search?q=${encodeURIComponent(query)}&country=${country}`);
+      const payload = await response.json();
+
+      if (!response.ok) {
+        throw new Error(payload.error || "Failed to run search.");
+      }
+
+      const results = payload.results || [];
+      setSearchResults(results);
+      setSelectedProductId(results[0]?.id || "");
+      setPage("Search");
+    } catch (error: any) {
+      setSearchResults([]);
+      setSelectedProductId("");
+      setSearchError(error?.message || "Search failed.");
+      setPage("Search");
+    } finally {
+      setSearchLoading(false);
+    }
+  }
+
   const activeProduct = product;
   const activeOffers = offers;
 
@@ -1725,13 +1742,8 @@ export default function TwoGoDealsMVP() {
           setQuery={setQuery}
           country={country}
           setCountry={setCountry}
-          onImmediateSearch={handleImmediateSearch}
-          onSuggestionSelect={handleSuggestionSelect}
-          onRecentSearchSelect={handleRecentSearchSelect}
+          onSearch={handleSearch}
           searchLoading={searchLoading}
-          suggestionLoading={suggestionLoading}
-          suggestions={suggestionMeta.results}
-          recentSearches={recentSearches}
           featuredProduct={featuredProduct}
           featuredLoading={featuredLoading}
           featuredError={featuredError}
@@ -1745,17 +1757,10 @@ export default function TwoGoDealsMVP() {
           setQuery={setQuery}
           country={country}
           setCountry={setCountry}
-          onImmediateSearch={handleImmediateSearch}
-          onSuggestionSelect={handleSuggestionSelect}
-          onRecentSearchSelect={handleRecentSearchSelect}
+          onSearch={handleSearch}
           searchLoading={searchLoading}
-          suggestionLoading={suggestionLoading}
           searchError={searchError || productError}
-          searchTouched={searchTouched}
-          searchMeta={searchMeta}
-          suggestions={suggestionMeta.results}
-          recentSearches={recentSearches}
-          filteredResults={filteredResults}
+          searchResults={searchResults}
           selectedProductId={selectedProductId}
           setSelectedProductId={setSelectedProductId}
           product={productLoading ? null : activeProduct}
@@ -1766,10 +1771,6 @@ export default function TwoGoDealsMVP() {
           setSortBy={setSortBy}
           filter={filter}
           setFilter={setFilter}
-          brandFilter={brandFilter}
-          setBrandFilter={setBrandFilter}
-          categoryFilter={categoryFilter}
-          setCategoryFilter={setCategoryFilter}
           setPage={setPage}
           onOpenMerchant={setMerchantOffer}
           onViewMerchant={setMerchantDetailsOffer}
@@ -1797,3 +1798,5 @@ export default function TwoGoDealsMVP() {
     </div>
   );
 }
+
+DELETE: app/api/offers/route.ts
